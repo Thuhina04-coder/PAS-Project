@@ -124,6 +124,23 @@ app.MapGet("/api/projects/mine", [Authorize(Roles = "Student")] async (ClaimsPri
     return Results.Ok(projects);
 });
 
+app.MapGet("/api/projects/status", [Authorize(Roles = "Student")] async (ClaimsPrincipal principal, AppDbContext db) =>
+{
+    var studentId = int.Parse(principal.FindFirstValue("uid")!);
+
+    var statuses = await db.Projects
+        .Where(p => p.StudentId == studentId)
+        .Select(p => new
+        {
+            p.Id,
+            p.Title,
+            p.Status
+        })
+        .ToListAsync();
+
+    return Results.Ok(statuses);
+});
+
 app.MapGet("/api/projects", [Authorize(Roles = "Supervisor,Admin")] async (ClaimsPrincipal principal, AppDbContext db) =>
 {
     var role = principal.FindFirstValue(ClaimTypes.Role) ?? string.Empty;
