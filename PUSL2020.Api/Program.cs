@@ -112,6 +112,7 @@ app.MapGet("/api/projects/mine", [Authorize(Roles = "Student")] async (ClaimsPri
     var projects = await db.Projects
         .Include(p => p.ResearchArea)
         .Where(p => p.StudentId == studentId)
+        .OrderByDescending(p => p.Id)
         .Select(p => new
         {
             p.Id,
