@@ -63,25 +63,48 @@ using (var scope = app.Services.CreateScope())
 
 app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, TokenService tokens, PasswordHasher<User> hasher) =>
 {
-    var user = await db.Users.SingleOrDefaultAsync(u => u.Username == request.Username);
+    var username = request.Username.Trim();
+    var password = request.Password;
+
+    if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+    {
+        return Results.BadRequest(new { message = "Username and password are required." });
+    }
+
+    var user = await db.Users.AsNoTracking().SingleOrDefaultAsync(u => u.Username == username);
     if (user is null)
     {
         return Results.Unauthorized();
     }
 
-    var verify = hasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
+    var verify = hasher.VerifyHashedPassword(user, user.PasswordHash, password);
     if (verify == PasswordVerificationResult.Failed)
     {
         return Results.Unauthorized();
     }
 
     var token = tokens.GenerateToken(user);
-    return Results.Ok(new { token, role = user.Role, name = user.FullName });
+    return Results.Ok(new
+    {
+        token,
+        tokenType = "Bearer",
+        expiresInMinutes = 240,
+        role = user.Role,
+        name = user.FullName
+    });
 });
 
 app.MapPost("/api/projects", [Authorize(Roles = "Student")] async (ProjectSubmissionRequest request, ClaimsPrincipal principal, AppDbContext db) =>
 {
     var studentId = int.Parse(principal.FindFirstValue("uid")!);
+    var title = request.Title.Trim();
+    var abstractText = request.Abstract.Trim();
+    var techStack = request.TechStack.Trim();
+
+    if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(abstractText) || string.IsNullOrWhiteSpace(techStack))
+    {
+        return Results.BadRequest(new { message = "Title, abstract, and tech stack are required." });
+    }
 
     var researchArea = await db.ResearchAreas.FindAsync(request.ResearchAreaId);
     if (researchArea is null)
@@ -89,11 +112,20 @@ app.MapPost("/api/projects", [Authorize(Roles = "Student")] async (ProjectSubmis
         return Results.BadRequest(new { message = "Research area not found." });
     }
 
+    var normalizedTitle = title.ToLowerInvariant();
+    var hasDuplicatePending = await db.Projects
+        .AnyAsync(p => p.StudentId == studentId && p.Status == "Pending" && p.Title.ToLower() == normalizedTitle);
+
+    if (hasDuplicatePending)
+    {
+        return Results.Conflict(new { message = "You already have a pending project with the same title." });
+    }
+
     var project = new Project
     {
-        Title = request.Title,
-        Abstract = request.Abstract,
-        TechStack = request.TechStack,
+        Title = title,
+        Abstract = abstractText,
+        TechStack = techStack,
         ResearchAreaId = researchArea.Id,
         StudentId = studentId,
         Status = "Pending"
@@ -110,6 +142,7 @@ app.MapGet("/api/projects/mine", [Authorize(Roles = "Student")] async (ClaimsPri
     var studentId = int.Parse(principal.FindFirstValue("uid")!);
 
     var projects = await db.Projects
+        .AsNoTracking()
         .Include(p => p.ResearchArea)
         .Where(p => p.StudentId == studentId)
         .OrderByDescending(p => p.Id)
@@ -122,15 +155,16 @@ app.MapGet("/api/projects/mine", [Authorize(Roles = "Student")] async (ClaimsPri
         })
         .ToListAsync();
 
-    return Results.Ok(projects);
+    return Results.Ok(new { total = projects.Count, items = projects });
 });
 
-app.MapGet("/api/projects", [Authorize(Roles = "Supervisor,Admin")] async (ClaimsPrincipal principal, AppDbContext db) =>
+app.MapGet("/api/projects", [Authorize(Roles = "Supervisor,Admin")] async (ClaimsPrincipal principal, string? status, int? researchAreaId, string? title, AppDbContext db) =>
 {
     var role = principal.FindFirstValue(ClaimTypes.Role) ?? string.Empty;
     var userId = int.Parse(principal.FindFirstValue("uid")!);
 
     IQueryable<Project> query = db.Projects
+        .AsNoTracking()
         .Include(p => p.ResearchArea)
         .Include(p => p.Student);
 
@@ -147,7 +181,26 @@ app.MapGet("/api/projects", [Authorize(Roles = "Supervisor,Admin")] async (Claim
         }
     }
 
-    var list = await query.Select(p => new
+    if (!string.IsNullOrWhiteSpace(status))
+    {
+        var normalizedStatus = status.Trim();
+        query = query.Where(p => p.Status == normalizedStatus);
+    }
+
+    if (researchAreaId.HasValue)
+    {
+        query = query.Where(p => p.ResearchAreaId == researchAreaId.Value);
+    }
+
+    if (!string.IsNullOrWhiteSpace(title))
+    {
+        var normalizedTitleFilter = title.Trim().ToLowerInvariant();
+        query = query.Where(p => p.Title.ToLower().Contains(normalizedTitleFilter));
+    }
+
+    var list = await query
+    .OrderByDescending(p => p.Id)
+    .Select(p => new
     {
         p.Id,
         p.Title,
@@ -162,11 +215,21 @@ app.MapGet("/api/projects", [Authorize(Roles = "Supervisor,Admin")] async (Claim
 app.MapPut("/api/supervisors/areas", [Authorize(Roles = "Supervisor")] async (SupervisorAreaSelectionRequest request, ClaimsPrincipal principal, AppDbContext db) =>
 {
     var supervisorId = int.Parse(principal.FindFirstValue("uid")!);
+    var requestedAreaIds = request.ResearchAreaIds.Distinct().ToList();
 
     var validAreaIds = await db.ResearchAreas
-        .Where(r => request.ResearchAreaIds.Contains(r.Id))
+        .Where(r => requestedAreaIds.Contains(r.Id))
         .Select(r => r.Id)
         .ToListAsync();
+
+    var invalidAreaIds = requestedAreaIds
+        .Except(validAreaIds)
+        .ToList();
+
+    if (invalidAreaIds.Count > 0)
+    {
+        return Results.BadRequest(new { message = "One or more research area ids are invalid.", invalidAreaIds });
+    }
 
     var existing = db.SupervisorResearchAreas.Where(sra => sra.UserId == supervisorId);
     db.SupervisorResearchAreas.RemoveRange(existing);
@@ -181,14 +244,28 @@ app.MapPut("/api/supervisors/areas", [Authorize(Roles = "Supervisor")] async (Su
     }
 
     await db.SaveChangesAsync();
-    return Results.Ok(new { count = validAreaIds.Count });
+    return Results.Ok(new { count = validAreaIds.Count, researchAreaIds = validAreaIds });
 });
 
-app.MapGet("/api/research-areas", [Authorize] async (AppDbContext db) =>
+app.MapGet("/api/research-areas", [Authorize] async (string? q, AppDbContext db) =>
 {
-    var areas = await db.ResearchAreas
+    var query = db.ResearchAreas.AsNoTracking().AsQueryable();
+
+    if (!string.IsNullOrWhiteSpace(q))
+    {
+        var normalized = q.Trim().ToLowerInvariant();
+        query = query.Where(r => r.Name.ToLower().Contains(normalized));
+    }
+
+    var areas = await query
         .OrderBy(r => r.Name)
-        .Select(r => new { r.Id, r.Name })
+        .Select(r => new
+        {
+            r.Id,
+            r.Name,
+            ProjectCount = r.Projects.Count,
+            SupervisorCount = r.SupervisorResearchAreas.Count
+        })
         .ToListAsync();
 
     return Results.Ok(areas);
@@ -196,7 +273,19 @@ app.MapGet("/api/research-areas", [Authorize] async (AppDbContext db) =>
 
 app.MapPost("/api/research-areas", [Authorize(Roles = "Admin")] async (ResearchAreaRequest request, AppDbContext db) =>
 {
-    var area = new ResearchArea { Name = request.Name };
+    var name = request.Name.Trim();
+    if (string.IsNullOrWhiteSpace(name))
+    {
+        return Results.BadRequest(new { message = "Research area name is required." });
+    }
+
+    var exists = await db.ResearchAreas.AnyAsync(r => r.Name.ToLower() == name.ToLower());
+    if (exists)
+    {
+        return Results.Conflict(new { message = "Research area already exists." });
+    }
+
+    var area = new ResearchArea { Name = name };
     db.ResearchAreas.Add(area);
     await db.SaveChangesAsync();
 
@@ -211,7 +300,19 @@ app.MapPut("/api/research-areas/{id:int}", [Authorize(Roles = "Admin")] async (i
         return Results.NotFound();
     }
 
-    area.Name = request.Name;
+    var name = request.Name.Trim();
+    if (string.IsNullOrWhiteSpace(name))
+    {
+        return Results.BadRequest(new { message = "Research area name is required." });
+    }
+
+    var exists = await db.ResearchAreas.AnyAsync(r => r.Id != id && r.Name.ToLower() == name.ToLower());
+    if (exists)
+    {
+        return Results.Conflict(new { message = "Another research area already uses this name." });
+    }
+
+    area.Name = name;
     await db.SaveChangesAsync();
 
     return Results.Ok(new { area.Id, area.Name });
@@ -224,6 +325,15 @@ app.MapDelete("/api/research-areas/{id:int}", [Authorize(Roles = "Admin")] async
     {
         return Results.NotFound();
     }
+
+    var inUseByProjects = await db.Projects.AnyAsync(p => p.ResearchAreaId == id);
+    if (inUseByProjects)
+    {
+        return Results.Conflict(new { message = "Research area cannot be deleted while projects are assigned to it." });
+    }
+
+    var areaSelections = db.SupervisorResearchAreas.Where(sra => sra.ResearchAreaId == id);
+    db.SupervisorResearchAreas.RemoveRange(areaSelections);
 
     db.ResearchAreas.Remove(area);
     await db.SaveChangesAsync();
